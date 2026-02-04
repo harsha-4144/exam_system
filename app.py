@@ -761,5 +761,9 @@ def report():
     
     return render_template("report.html", rows=rows, total=total)
 
+# ... (all your existing code remains the same until the end) ...
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Get port from environment variable or use 5000
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
