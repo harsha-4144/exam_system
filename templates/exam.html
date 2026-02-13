@@ -3,7 +3,6 @@
 <head>
     <title>{{ title }}</title>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
-
     <style>
         :root {
             --bg: #f4f6f8;
@@ -171,13 +170,24 @@
             align-items: center;
         }
 
-        select {
+        .language-select {
             background: #020617;
             color: #e5e7eb;
             border: 1px solid #1e293b;
-            padding: 4px 6px;
+            padding: 6px 10px;
             border-radius: 4px;
             font-size: 13px;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .language-select:hover {
+            background: #1e293b;
+        }
+
+        .language-select option {
+            background: #020617;
+            color: #e5e7eb;
         }
 
         button {
@@ -236,20 +246,61 @@
         }
 
         .output-title {
-            padding: 4px 10px;
-            font-size: 11px;
+            padding: 8px 12px;
+            font-size: 12px;
             color: #94a3b8;
             border-bottom: 1px solid var(--panel-border-dark);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
 
         .output-content {
             flex: 1;
-            padding: 6px 10px;
-            font-family: monospace;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
             font-size: 13px;
             color: #e5e7eb;
             overflow-y: auto;
             white-space: pre-wrap;
+            line-height: 1.5;
+            background: #0a0c10;
+        }
+
+        .input-line {
+            display: flex;
+            align-items: center;
+            margin-top: 4px;
+        }
+
+        .prompt {
+            color: #4ade80;
+            margin-right: 8px;
+            font-weight: bold;
+        }
+
+        .input-field {
+            background: transparent;
+            border: none;
+            color: #e5e7eb;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            flex: 1;
+            outline: none;
+            padding: 2px 0;
+        }
+
+        .input-field::placeholder {
+            color: #6b7280;
+            font-style: italic;
+        }
+
+        .error-output {
+            color: #f87171;
+        }
+
+        .success-output {
+            color: #4ade80;
         }
 
         body.dragging {
@@ -278,7 +329,7 @@
             background: white;
             border: 1px solid #e5e7eb;
             border-radius: 4px;
-            font-family: monospace;
+            font-family: 'Courier New', monospace;
             font-size: 13px;
             overflow-x: auto;
         }
@@ -293,12 +344,47 @@
             border-radius: 6px;
             margin-top: 12px;
         }
+
+        .language-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            background: var(--primary);
+            color: white;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+
+        .terminal-header {
+            display: flex;
+            gap: 12px;
+        }
+
+        .terminal-prompt {
+            color: #4ade80;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 14px;
+            background: #94a3b8;
+            animation: blink 1s infinite;
+            vertical-align: middle;
+            margin-left: 2px;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
     </style>
 </head>
 <body>
 
 <div class="header">
-    <div>Coding Exam - {{ title }}</div>
+    <div>Coding Exam - {{ title }} <span class="language-badge" id="currentLang">Python</span></div>
     <div id="timer" class="timer">--:--</div>
 </div>
 
@@ -342,6 +428,7 @@
 <form method="POST" action="/submit" id="codeForm" style="flex:1; display:flex; flex-direction:column;">
     <input type="hidden" name="question_id" value="{{ question_id }}">
     <input type="hidden" name="code" id="codeInput">
+    <input type="hidden" name="language" id="languageInput" value="python">
 
     <div class="editor-area">
         <div id="editor"></div>
@@ -349,11 +436,9 @@
 
     <div class="controls">
         <div class="controls-left">
-            <select id="language">
+            <select id="language" class="language-select">
                 <option value="python">Python</option>
-                <option value="cpp">C++</option>
                 <option value="c">C</option>
-                <option value="java">Java</option>
             </select>
             <button type="button" class="fullscreen-btn" id="fsBtn">Full Screen</button>
         </div>
@@ -368,8 +453,16 @@
 <div id="splitter"></div>
 
 <div class="output-panel" id="outputPanel">
-    <div class="output-title">Output</div>
-    <div id="output" class="output-content">Output will appear here.</div>
+    <div class="output-title">
+        <span class="terminal-header">
+            <span>Terminal</span>
+            <span class="terminal-prompt">$</span>
+        </span>
+        <span id="runStatus"></span>
+    </div>
+    <div id="output" class="output-content">
+        <span style="color: #6b7280;">&#9654; Click 'Run' to execute your code.</span>
+    </div>
 </div>
 
 </div>
@@ -377,26 +470,44 @@
 </div>
 
 <script>
+// Monaco Editor configuration
 require.config({ paths: { 'vs': 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
+
 require(['vs/editor/editor.main'], function () {
     window.editor = monaco.editor.create(document.getElementById('editor'), {
-        value: `# Write your code here
-# Read from input() and print the result
-# Example for Sum of Two Numbers:
-# a, b = map(int, input().split())
-# print(a + b)`,
+        value: '',  // EMPTY EDITOR - students write everything from scratch
         language: 'python',
         theme: 'vs-dark',
         automaticLayout: true,
         fontSize: 14,
-        minimap: { enabled: false }
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        renderLineHighlight: 'all',
+        wordWrap: 'on',
+        placeholder: 'Write your code here...'
     });
 });
 
-document.getElementById("language").addEventListener("change", function () {
-    monaco.editor.setModelLanguage(editor.getModel(), this.value);
+// Language selector - ONLY Python and C
+const languageSelect = document.getElementById('language');
+const languageInput = document.getElementById('languageInput');
+const currentLang = document.getElementById('currentLang');
+
+languageSelect.addEventListener('change', function() {
+    const lang = this.value;
+    
+    // Update editor language
+    monaco.editor.setModelLanguage(editor.getModel(), lang);
+    
+    // Update hidden input and display
+    languageInput.value = lang;
+    currentLang.textContent = this.options[this.selectedIndex].text;
+    
+    // Clear the editor when switching languages
+    editor.setValue('');
 });
 
+// Full screen functionality
 const fsBtn = document.getElementById("fsBtn");
 const rightColumn = document.getElementById("rightColumn");
 
@@ -414,25 +525,163 @@ document.addEventListener("keydown", e => {
     }
 });
 
-function runCode() {
-    const out = document.getElementById("output");
-    out.textContent = "Running...";
-    const data = new FormData();
-    data.append("question_id", "{{ question_id }}");
-    data.append("code", editor.getValue());
+// Terminal state
+let terminalState = {
+    waitingForInput: false,
+    inputBuffer: '',
+    resolveInput: null,
+    programOutput: '',
+    currentInputLine: null
+};
 
-    fetch("/run", { method: "POST", body: data })
-        .then(r => r.json())
-        .then(res => {
-            if (res.expected) {
-                out.textContent = `Your Output:\n${res.output}\n\nExpected Output:\n${res.expected}`;
-            } else {
-                out.textContent = res.output || "No output";
-            }
-        })
-        .catch(err => out.textContent = "Error: " + err);
+// Function to append to terminal
+function appendToTerminal(text, className = '') {
+    const output = document.getElementById('output');
+    const span = document.createElement('span');
+    span.textContent = text;
+    if (className) span.className = className;
+    output.appendChild(span);
+    output.appendChild(document.createElement('br'));
+    output.scrollTop = output.scrollHeight;
 }
 
+// Function to create input line
+function createInputLine(promptText = 'Enter input: ') {
+    const output = document.getElementById('output');
+    
+    // Create container for input line
+    const inputLine = document.createElement('div');
+    inputLine.className = 'input-line';
+    
+    // Create prompt
+    const prompt = document.createElement('span');
+    prompt.className = 'prompt';
+    prompt.textContent = promptText;
+    
+    // Create input field
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'input-field';
+    input.placeholder = 'Type here and press Enter...';
+    input.autofocus = true;
+    
+    inputLine.appendChild(prompt);
+    inputLine.appendChild(input);
+    output.appendChild(inputLine);
+    output.scrollTop = output.scrollHeight;
+    
+    return { inputLine, input };
+}
+
+// Handle input submission
+// Run code
+async function runCode() {
+    const out = document.getElementById("output");
+    const status = document.getElementById("runStatus");
+    
+    const code = editor.getValue();
+    
+    if (!code.trim()) {
+        out.innerHTML = '';
+        status.textContent = "";
+        return;
+    }
+    
+    // Clear terminal
+    out.innerHTML = '';
+    
+    try {
+        let inputData = '';
+        let programFinished = false;
+        let output = '';
+        let error = null;
+        
+        while (!programFinished) {
+            const data = new FormData();
+            data.append("question_id", "{{ question_id }}");
+            data.append("code", code);
+            data.append("language", languageSelect.value);
+            data.append("input", inputData);
+            
+            const response = await fetch("/run", { 
+                method: "POST", 
+                body: data 
+            });
+            const result = await response.json();
+            
+            if (result.needs_input) {
+                // Program is waiting for input - show prompt and get input
+                const userInput = await handleInput(result.prompt || '');
+                inputData += userInput + '\n';
+            } else {
+                // Program finished
+                programFinished = true;
+                output = result.output;
+                error = result.error;
+            }
+        }
+        
+        // Display ONLY the program output
+        if (error) {
+            out.textContent = error;
+            status.textContent = "Error";
+        } else {
+            out.textContent = output;
+            status.textContent = "Done";
+        }
+        
+    } catch (err) {
+        out.textContent = err;
+        status.textContent = "Error";
+    }
+}
+
+// Handle input submission
+function handleInput(promptText) {
+    return new Promise((resolve) => {
+        const output = document.getElementById('output');
+        
+        // Create input line
+        const inputLine = document.createElement('div');
+        inputLine.style.display = 'flex';
+        inputLine.style.alignItems = 'center';
+        
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.style.background = 'transparent';
+        input.style.border = 'none';
+        input.style.color = '#e5e7eb';
+        input.style.fontFamily = "'Courier New', monospace";
+        input.style.fontSize = '13px';
+        input.style.flex = '1';
+        input.style.outline = 'none';
+        input.style.padding = '2px 0';
+        input.autofocus = true;
+        
+        // Add to output
+        output.appendChild(inputLine);
+        inputLine.appendChild(input);
+        output.scrollTop = output.scrollHeight;
+        
+        // Handle enter key
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const value = input.value;
+                
+                // Show what was typed
+                const textNode = document.createTextNode(value + '\n');
+                output.insertBefore(textNode, inputLine);
+                inputLine.remove();
+                
+                resolve(value);
+            }
+        });
+        
+        input.focus();
+    });
+}
+// Splitter for resizing panels
 const splitter = document.getElementById("splitter");
 const editorPanel = document.getElementById("editorPanel");
 const outputPanel = document.getElementById("outputPanel");
@@ -463,8 +712,7 @@ document.addEventListener("mousemove", e => {
     editorPanel.style.flex = "none";
     outputPanel.style.flex = "none";
     editorPanel.style.height = y + "px";
-    outputPanel.style.height =
-        rect.height - y - splitter.offsetHeight + "px";
+    outputPanel.style.height = rect.height - y - splitter.offsetHeight + "px";
 
     editor.layout();
 });
@@ -472,9 +720,9 @@ document.addEventListener("mousemove", e => {
 // Timer functionality
 const timerElement = document.getElementById("timer");
 {% if time_limit %}
-    let totalSeconds = {{ time_limit }};  // Custom time limit from database
+    let totalSeconds = {{ time_limit }};
 {% else %}
-    let totalSeconds = 30 * 60;  // Default 30 minutes
+    let totalSeconds = 30 * 60;
 {% endif %}
 
 let timerInterval;
@@ -486,7 +734,6 @@ function updateTimer() {
         
         clearInterval(timerInterval);
         
-        // Auto-submit when time expires
         if (confirm("Time's up! Your code will be submitted automatically.")) {
             document.getElementById("codeForm").submit();
         }
@@ -500,10 +747,9 @@ function updateTimer() {
         String(minutes).padStart(2, "0") + ":" + 
         String(seconds).padStart(2, "0");
     
-    // Update timer color based on remaining time
-    if (totalSeconds <= 60) { // Less than 1 minute
+    if (totalSeconds <= 60) {
         timerElement.className = "timer danger";
-    } else if (totalSeconds <= 300) { // Less than 5 minutes
+    } else if (totalSeconds <= 300) {
         timerElement.className = "timer warning";
     } else {
         timerElement.className = "timer";
@@ -512,58 +758,13 @@ function updateTimer() {
     totalSeconds--;
 }
 
-// Start the timer
 updateTimer();
 timerInterval = setInterval(updateTimer, 1000);
 
-// Save timer state in localStorage to persist across page refreshes
-window.addEventListener('beforeunload', function() {
-    localStorage.setItem('timer_{{ question_id }}', totalSeconds);
-    localStorage.setItem('timer_start_{{ question_id }}', Date.now());
-});
-
-// Restore timer state if exists - BUT ONLY IF WE'RE CONTINUING AN ATTEMPT
-document.addEventListener('DOMContentLoaded', function() {
-    const savedSeconds = localStorage.getItem('timer_{{ question_id }}');
-    const startTime = localStorage.getItem('timer_start_{{ question_id }}');
-    const now = Date.now();
-    
-    // Check if we have a saved timer and if it's recent (within 2 hours)
-    if (savedSeconds && startTime) {
-        const elapsedSeconds = Math.floor((now - parseInt(startTime)) / 1000);
-        const newTotalSeconds = parseInt(savedSeconds) - elapsedSeconds;
-        
-        // Only restore if there's still time left AND it's been less than 2 hours
-        if (newTotalSeconds > 0 && elapsedSeconds < 7200) { // 2 hours = 7200 seconds
-            totalSeconds = newTotalSeconds;
-            console.log('Restored timer from localStorage:', totalSeconds, 'seconds remaining');
-        } else {
-            // Clear old timer data and start fresh
-            localStorage.removeItem('timer_{{ question_id }}');
-            localStorage.removeItem('timer_start_{{ question_id }}');
-            console.log('Starting fresh timer');
-        }
-    } else {
-        console.log('No saved timer found, starting fresh');
-    }
-    
-    updateTimer();
-});
-
-// Clear timer when starting a fresh attempt
-function clearTimerStorage() {
-    localStorage.removeItem('timer_{{ question_id }}');
-    localStorage.removeItem('timer_start_{{ question_id }}');
-}
-
-// Call this when the page loads to ensure we're not restoring an old timer
-// unless we explicitly want to continue
-clearTimerStorage();
-
-document.getElementById("codeForm").addEventListener("submit", function () {
+// Form submission
+document.getElementById("codeForm").addEventListener("submit", function() {
     document.getElementById("codeInput").value = editor.getValue();
-    // Clear timer from localStorage on submit
-    clearTimerStorage();
+    document.getElementById("languageInput").value = languageSelect.value;
 });
 
 // Keyboard shortcuts
@@ -578,17 +779,19 @@ document.addEventListener('keydown', function(e) {
         e.preventDefault();
         runCode();
     }
-});
-
-// Warn user if they try to leave the page
-window.addEventListener('beforeunload', function(e) {
-    if (totalSeconds > 0 && totalSeconds < {{ time_limit if time_limit else 1800 }}) {
+    // Ctrl+Shift+Space to format code
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === ' ') {
         e.preventDefault();
-        e.returnValue = 'You have unsaved work and the timer is still running. Are you sure you want to leave?';
-        return e.returnValue;
+        editor.getAction('editor.action.formatDocument').run();
     }
 });
 
+// Initialize
+document.addEventListener('DOMContentLoaded', function() {
+    languageInput.value = 'python';
+    currentLang.textContent = 'Python';
+    editor.setValue('');
+});
 </script>
 
 </body>

@@ -7,3 +7,6 @@ Jinja2==3.1.6
 MarkupSafe==3.0.3
 packaging==25.0
 Werkzeug==3.1.5
+psycopg2-binary==2.9.9
+supabase==2.0.3
+python-dotenv==1.0.0

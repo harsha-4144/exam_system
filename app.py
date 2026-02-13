@@ -1,16 +1,30 @@
-from flask import Flask, render_template, request, redirect, session
-import sqlite3
-import subprocess
 import os
+from flask import Flask, render_template, request, redirect, session, jsonify
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import subprocess
 import resource
 import tempfile
 from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = "exam-secret-key"
+app.secret_key = os.getenv("SECRET_KEY", "exam-secret-key-change-this")
+
+# ---------- DATABASE ----------
+def get_db():
+    """Get PostgreSQL database connection"""
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        return None
 
 def db():
-    return sqlite3.connect("exam.db")
+    return get_db()
 
 def is_logged_in():
     return "user_id" in session
@@ -19,7 +33,6 @@ def is_admin():
     return session.get("username") == "admin"
 
 # ---------- SECURITY ----------
-
 BLOCKED_KEYWORDS = [
     "import os",
     "import sys",
@@ -27,35 +40,151 @@ BLOCKED_KEYWORDS = [
     "import socket",
     "open(",
     "exec(",
-    "eval("
+    "eval(",
+    "__import__",
 ]
 
-def is_code_safe(code):
+def is_code_safe(code, language):
+    """Check if code contains blocked keywords (only for Python)"""
+    if language != 'python':
+        return True, None
+    
     for k in BLOCKED_KEYWORDS:
         if k in code:
             return False, k
     return True, None
 
 def limit_resources():
-    resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
-    resource.setrlimit(resource.RLIMIT_AS, (64 * 1024 * 1024, 64 * 1024 * 1024))
+    """Set resource limits for code execution"""
+    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+
+# ---------- CODE EXECUTION ----------
+def execute_code(code, language, input_data):
+    """Execute code in Python or C"""
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            if language == 'python':
+                return execute_python(code, input_data, tmpdir)
+            elif language == 'c':
+                return execute_c(code, input_data, tmpdir)
+            else:
+                return {
+                    'success': False,
+                    'output': f'Unsupported language: {language}',
+                    'error': 'Unsupported language'
+                }
+        except Exception as e:
+            return {
+                'success': False,
+                'output': str(e),
+                'error': str(e)
+            }
+
+def execute_python(code, input_data, tmpdir):
+    """Execute Python code"""
+    filepath = os.path.join(tmpdir, 'script.py')
+    with open(filepath, 'w') as f:
+        f.write(code)
+    
+    try:
+        result = subprocess.run(
+            ['python3', filepath],
+            input=input_data,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            preexec_fn=limit_resources
+        )
+        
+        return {
+            'success': result.returncode == 0,
+            'output': result.stdout,
+            'error': result.stderr if result.stderr else None
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            'success': False,
+            'output': 'TIME LIMIT EXCEEDED',
+            'error': 'Timeout'
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'output': str(e),
+            'error': str(e)
+        }
+
+def execute_c(code, input_data, tmpdir):
+    """Execute C code"""
+    source_file = os.path.join(tmpdir, 'main.c')
+    executable = os.path.join(tmpdir, 'main')
+    
+    with open(source_file, 'w') as f:
+        f.write(code)
+    
+    # Compile
+    try:
+        compile_result = subprocess.run(
+            ['gcc', source_file, '-o', executable, '-std=c11'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if compile_result.returncode != 0:
+            return {
+                'success': False,
+                'output': 'Compilation Error',
+                'error': compile_result.stderr
+            }
+        
+        # Run
+        run_result = subprocess.run(
+            [executable],
+            input=input_data,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            preexec_fn=limit_resources
+        )
+        
+        return {
+            'success': run_result.returncode == 0,
+            'output': run_result.stdout,
+            'error': run_result.stderr if run_result.stderr else None
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            'success': False,
+            'output': 'TIME LIMIT EXCEEDED',
+            'error': 'Timeout'
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'output': str(e),
+            'error': str(e)
+        }
 
 # ---------- AUTH ----------
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-
     if request.method == "POST":
         username = request.form.get("username")
         password = request.form.get("password")
-
+        
         conn = db()
+        if not conn:
+            return "Database connection error", 500
+            
         cur = conn.cursor()
-        cur.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+        cur.execute("SELECT id, password FROM users WHERE username = %s", (username,))
         row = cur.fetchone()
         conn.close()
-
+        
         if not row:
             error = "Invalid username"
         else:
@@ -66,7 +195,7 @@ def login():
                 session["user_id"] = user_id
                 session["username"] = username
                 return redirect("/")
-
+    
     return render_template("login.html", error=error)
 
 @app.route("/register", methods=["GET", "POST"])
@@ -74,29 +203,31 @@ def register():
     if request.method == "POST":
         username = request.form.get("username")
         password = request.form.get("password")
-
+        
         if not username or not password:
             return "Username and password required"
-
+        
         hashed = generate_password_hash(password)
-
+        
         conn = db()
+        if not conn:
+            return "Database connection error", 500
+            
         cur = conn.cursor()
-
-        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
             conn.close()
             return "User already exists. Please login."
-
+        
         cur.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
+            "INSERT INTO users (username, password) VALUES (%s, %s)",
             (username, hashed)
         )
         conn.commit()
         conn.close()
-
+        
         return redirect("/login")
-
+    
     return render_template("register.html")
 
 @app.route("/logout")
@@ -105,29 +236,30 @@ def logout():
     return redirect("/login")
 
 # ---------- CORE ----------
-
 @app.route("/")
 def questions():
     if "user_id" not in session:
         return redirect("/login")
-
+    
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
-
     cur.execute("""
         SELECT q.id, q.title,
         EXISTS (
             SELECT 1 FROM submissions s
             WHERE s.question_id = q.id
-              AND s.user_id = ?
+              AND s.user_id = %s
         ) AS completed
         FROM questions q
         ORDER BY q.id
     """, (session["user_id"],))
-
+    
     questions = cur.fetchall()
     conn.close()
-
+    
     return render_template(
         "questions.html",
         questions=questions,
@@ -139,112 +271,82 @@ def questions():
 def exam_page(qid):
     if not is_logged_in():
         return redirect("/login")
-
+    
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
-
-    # Fetch question with time_limit
     cur.execute(
-        "SELECT title, description, time_limit FROM questions WHERE id = ?",
+        "SELECT title, description, time_limit FROM questions WHERE id = %s",
         (qid,)
     )
     q = cur.fetchone()
-
-    # Fetch FIRST TWO test cases as examples
-    cur.execute(
-        """
+    
+    cur.execute("""
         SELECT input, expected_output
         FROM test_cases
-        WHERE question_id = ? AND is_example = 1
+        WHERE question_id = %s AND is_example = 1
         ORDER BY id ASC
-        """,
-        (qid,)
-    )
+        LIMIT 2
+    """, (qid,))
     examples = cur.fetchall()
-
+    
     conn.close()
-
-    # Convert time_limit to minutes for display
+    
     time_limit_minutes = q[2] // 60 if q[2] else 30
-
+    
     return render_template(
         "exam.html",
         question_id=qid,
         title=q[0],
         description=q[1],
         examples=examples,
-        time_limit=q[2],  # Pass in seconds
-        time_limit_minutes=time_limit_minutes  # Pass in minutes for display
+        time_limit=q[2],
+        time_limit_minutes=time_limit_minutes
     )
 
 @app.route("/run", methods=["POST"])
 def run_code():
     if not is_logged_in():
-        return {"output": "Not logged in"}, 401
-
-    question_id = request.form.get("question_id")
+        return jsonify({"output": "Not logged in", "error": True}), 401
+    
     code = request.form.get("code")
-
+    language = request.form.get("language", "python")
+    input_data = request.form.get("input", "")
+    
     if not code:
-        return {"output": "No code provided"}
-
-    safe, keyword = is_code_safe(code)
+        return jsonify({"output": "No code provided", "error": True})
+    
+    # Security check for Python only
+    safe, keyword = is_code_safe(code, language)
     if not safe:
-        return {"output": f"Blocked keyword detected: {keyword}"}
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT input, expected_output
-        FROM test_cases
-        WHERE question_id = ?
-        ORDER BY id ASC
-        LIMIT 1
-    """, (question_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        return {"output": "No test cases found"}
-
-    inp, expected = row
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=True) as f:
-            f.write(code.encode())
-            f.flush()
-
-            r = subprocess.run(
-                ["python3", f.name],
-                input=inp,
-                capture_output=True,
-                text=True,
-                timeout=2,
-                preexec_fn=limit_resources
-            )
-
-            if r.returncode != 0:
-                return {"output": r.stderr or "Runtime error"}
-
-            return {
-                "output": r.stdout.strip(),
-                "expected": expected.strip()
-            }
-
-    except subprocess.TimeoutExpired:
-        return {"output": "TIME LIMIT EXCEEDED"}
+        return jsonify({
+            "output": f"Blocked keyword detected: {keyword}",
+            "error": True
+        })
+    
+    # Execute code with provided input
+    result = execute_code(code, language, input_data)
+    
+    return jsonify({
+        "output": result.get('output', ''),
+        "error": result.get('error'),
+        "success": result.get('success', False)
+    })
 
 @app.route("/submit", methods=["POST"])
 def submit():
     if "user_id" not in session:
         return redirect("/login")
-
+    
     user_id = session["user_id"]
     question_id = int(request.form.get("question_id"))
     code = request.form.get("code") or ""
-
-    # ---------- SAFETY CHECK ----------
-    safe, keyword = is_code_safe(code)
+    language = request.form.get("language", "python")
+    
+    # Security check for Python only
+    safe, keyword = is_code_safe(code, language)
     if not safe:
         return render_template(
             "result.html",
@@ -256,79 +358,60 @@ def submit():
             score=0,
             question_id=question_id
         )
-
-    # ---------- LOAD TEST CASES ----------
+    
+    # Load test cases (only non-example ones for grading)
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     cur.execute(
-        "SELECT input, expected_output FROM test_cases WHERE question_id = ? AND is_example = 0",
+        "SELECT input, expected_output FROM test_cases WHERE question_id = %s AND is_example = 0",
         (question_id,)
     )
     tests = cur.fetchall()
     conn.close()
-
+    
     results = []
     passed_count = 0
     total_tests = len(tests)
-
-    # ---------- EXECUTION ----------
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=True) as f:
-            f.write(code.encode())
-            f.flush()
-
-            for i, (inp, exp) in enumerate(tests, start=1):
-                r = subprocess.run(
-                    ["python3", f.name],
-                    input=inp,
-                    text=True,
-                    capture_output=True,
-                    timeout=2,
-                    preexec_fn=limit_resources
-                )
-
-                actual = r.stdout.strip() if r.stdout else ""
-
-                if r.returncode == 0 and actual == exp.strip():
-                    status = "PASS"
-                    passed_count += 1
-                else:
-                    status = "FAIL"
-
-                results.append({
-                    "id": i,
-                    "input": inp,
-                    "expected": exp.strip(),
-                    "actual": actual,
-                    "status": status
-                })
-
-    except subprocess.TimeoutExpired:
-        return render_template(
-            "result.html",
-            verdict="TIMEOUT",
-            results=[],
-            passed=0,
-            total=total_tests,
-            score=0,
-            question_id=question_id
-        )
-
-    # ---------- FINAL VERDICT ----------
+    
+    # Execute against all test cases
+    for i, (inp, exp) in enumerate(tests, start=1):
+        result = execute_code(code, language, inp)
+        
+        if result['success'] and result['output'].strip() == exp.strip():
+            status = "PASS"
+            passed_count += 1
+        else:
+            status = "FAIL"
+        
+        results.append({
+            "id": i,
+            "input": inp,
+            "expected": exp.strip(),
+            "actual": result['output'].strip() if result['success'] else result['output'],
+            "status": status,
+            "error": result['error']
+        })
+    
+    # Final verdict
     verdict = "PASS" if passed_count == total_tests else "FAIL"
     score = int((passed_count / total_tests) * 100) if total_tests else 0
-
-    # ---------- SAVE SUBMISSION ----------
+    
+    # Save submission
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO submissions (user_id, question_id, verdict, score) VALUES (?, ?, ?, ?)",
-        (user_id, question_id, verdict, score)
+        "INSERT INTO submissions (user_id, question_id, code, verdict, score) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, question_id, code, verdict, score)
     )
     conn.commit()
     conn.close()
-
-    # ---------- RESULT PAGE ----------
+    
     return render_template(
         "result.html",
         verdict=verdict,
@@ -339,14 +422,17 @@ def submit():
         question_id=question_id
     )
 
-# ---------- ADMIN ----------
-
+# ---------- ADMIN ROUTES ----------
+# ---------- ADMIN ROUTES ----------
 @app.route("/admin/dashboard")
 def admin_dashboard():
     if not is_logged_in() or not is_admin():
         return redirect("/")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     
     # Get statistics
@@ -399,6 +485,9 @@ def admin_questions():
         return redirect("/")
 
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
 
     cur.execute("""
@@ -419,14 +508,17 @@ def delete_question(qid):
         return redirect("/")
 
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
 
     # Delete test cases first
-    cur.execute("DELETE FROM test_cases WHERE question_id = ?", (qid,))
+    cur.execute("DELETE FROM test_cases WHERE question_id = %s", (qid,))
     # Delete submissions related to this question
-    cur.execute("DELETE FROM submissions WHERE question_id = ?", (qid,))
+    cur.execute("DELETE FROM submissions WHERE question_id = %s", (qid,))
     # Delete the question
-    cur.execute("DELETE FROM questions WHERE id = ?", (qid,))
+    cur.execute("DELETE FROM questions WHERE id = %s", (qid,))
 
     conn.commit()
     conn.close()
@@ -448,14 +540,20 @@ def admin():
         examples = request.form.getlist("is_example[]")
 
         conn = db()
+        if not conn:
+            return "Database connection error", 500
+            
         cur = conn.cursor()
 
         # Insert question with time_limit
         cur.execute(
-            "INSERT INTO questions (title, description, marks, time_limit) VALUES (?, ?, ?, ?)",
+            "INSERT INTO questions (title, description, marks, time_limit) VALUES (%s, %s, %s, %s)",
             (title, description, marks, time_limit)
         )
-        qid = cur.lastrowid
+        
+        # Get the ID of the inserted question
+        cur.execute("SELECT lastval()")
+        qid = cur.fetchone()[0]
 
         # Insert test cases
         for i in range(len(inputs)):
@@ -464,7 +562,7 @@ def admin():
             cur.execute(
                 """
                 INSERT INTO test_cases (question_id, input, expected_output, is_example)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (qid, inputs[i], outputs[i], is_example)
             )
@@ -482,6 +580,9 @@ def edit_question(qid):
         return redirect("/")
 
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
 
     if request.method == "POST":
@@ -494,12 +595,12 @@ def edit_question(qid):
 
         # Update question
         cur.execute(
-            "UPDATE questions SET title = ?, description = ?, time_limit = ? WHERE id = ?",
+            "UPDATE questions SET title = %s, description = %s, time_limit = %s WHERE id = %s",
             (title, description, time_limit, qid)
         )
 
         # Remove old test cases
-        cur.execute("DELETE FROM test_cases WHERE question_id = ?", (qid,))
+        cur.execute("DELETE FROM test_cases WHERE question_id = %s", (qid,))
 
         # Insert new test cases
         for i in range(len(inputs)):
@@ -508,7 +609,7 @@ def edit_question(qid):
             cur.execute(
                 """
                 INSERT INTO test_cases (question_id, input, expected_output, is_example)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (qid, inputs[i], outputs[i], is_example)
             )
@@ -520,7 +621,7 @@ def edit_question(qid):
 
     # GET: load existing data
     cur.execute(
-        "SELECT title, description, time_limit FROM questions WHERE id = ?",
+        "SELECT title, description, time_limit FROM questions WHERE id = %s",
         (qid,)
     )
     question = cur.fetchone()
@@ -528,7 +629,7 @@ def edit_question(qid):
     cur.execute(
         """SELECT input, expected_output, is_example
         FROM test_cases
-        WHERE question_id = ?
+        WHERE question_id = %s
         ORDER BY id
         """,
         (qid,)
@@ -550,6 +651,9 @@ def admin_users():
         return redirect("/")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     cur.execute("SELECT id, username FROM users ORDER BY id")
     users = cur.fetchall()
@@ -565,10 +669,12 @@ def admin_user_reports():
         return redirect("/")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     
     # Get all users with their submission stats
-    # FIXED: Use COALESCE to handle NULL values when users have no submissions
     cur.execute("""
         SELECT 
             u.id, 
@@ -609,10 +715,13 @@ def admin_user_detail(user_id):
         return redirect("/")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     
     # Get user info
-    cur.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
     user = cur.fetchone()
     
     if not user:
@@ -631,7 +740,7 @@ def admin_user_detail(user_id):
             s.question_id
         FROM submissions s
         JOIN questions q ON s.question_id = q.id
-        WHERE s.user_id = ?
+        WHERE s.user_id = %s
         ORDER BY s.timestamp DESC
     """, (user_id,))
     
@@ -648,7 +757,7 @@ def admin_user_detail(user_id):
     all_questions = cur.fetchall()
     
     # Get which questions user has attempted
-    cur.execute("SELECT DISTINCT question_id FROM submissions WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT DISTINCT question_id FROM submissions WHERE user_id = %s", (user_id,))
     attempted_questions = [row[0] for row in cur.fetchall()]
     
     question_status = []
@@ -680,9 +789,12 @@ def admin_reports():
         return redirect("/")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     
-    # Get submission statistics - FIXED: using correct table structure
+    # Get submission statistics
     cur.execute("""
         SELECT 
             u.username, 
@@ -739,6 +851,9 @@ def report():
         return redirect("/login")
     
     conn = db()
+    if not conn:
+        return "Database connection error", 500
+        
     cur = conn.cursor()
     
     # Get user's submission summary
@@ -750,7 +865,7 @@ def report():
                END as verdict,
                COALESCE(s.score, 0) as score
         FROM questions q
-        LEFT JOIN submissions s ON s.question_id = q.id AND s.user_id = ?
+        LEFT JOIN submissions s ON s.question_id = q.id AND s.user_id = %s
         ORDER BY q.id
     """, (session["user_id"],))
     
@@ -760,10 +875,6 @@ def report():
     conn.close()
     
     return render_template("report.html", rows=rows, total=total)
-
-# ... (all your existing code remains the same until the end) ...
-
 if __name__ == "__main__":
-    # Get port from environment variable or use 5000
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
