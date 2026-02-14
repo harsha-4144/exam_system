@@ -10,3 +10,4 @@ Werkzeug==3.1.5
 psycopg2-binary==2.9.9
 supabase==2.0.3
 python-dotenv==1.0.0
+pexpect==4.8.0
