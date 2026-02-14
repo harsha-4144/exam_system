@@ -3,6 +3,8 @@
 <head>
     <title>{{ title }}</title>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt-stdlib.js"></script>
     <style>
         :root {
             --bg: #f4f6f8;
@@ -267,6 +269,17 @@
             background: #0a0c10;
         }
 
+        .output-content.awaiting-input::after {
+            content: "";
+            display: inline-block;
+            width: 8px;
+            height: 14px;
+            background: #94a3b8;
+            vertical-align: middle;
+            margin-left: 2px;
+            animation: blink 1s infinite;
+        }
+
         .input-line {
             display: flex;
             align-items: center;
@@ -454,10 +467,7 @@
 
 <div class="output-panel" id="outputPanel">
     <div class="output-title">
-        <span class="terminal-header">
-            <span>Terminal</span>
-            <span class="terminal-prompt">$</span>
-        </span>
+        <span class="terminal-header">Terminal</span>
         <span id="runStatus"></span>
     </div>
     <div id="output" class="output-content">
@@ -486,6 +496,9 @@ require(['vs/editor/editor.main'], function () {
         wordWrap: 'on',
         placeholder: 'Write your code here...'
     });
+
+    // Ensure initial content is always set only after editor is ready.
+    window.editor.setValue('');
 });
 
 // Language selector - ONLY Python and C
@@ -495,16 +508,17 @@ const currentLang = document.getElementById('currentLang');
 
 languageSelect.addEventListener('change', function() {
     const lang = this.value;
+    if (!window.editor) return;
     
     // Update editor language
-    monaco.editor.setModelLanguage(editor.getModel(), lang);
+    monaco.editor.setModelLanguage(window.editor.getModel(), lang);
     
     // Update hidden input and display
     languageInput.value = lang;
     currentLang.textContent = this.options[this.selectedIndex].text;
     
     // Clear the editor when switching languages
-    editor.setValue('');
+    window.editor.setValue('');
 });
 
 // Full screen functionality
@@ -516,7 +530,9 @@ fsBtn.onclick = () => {
     fsBtn.textContent = rightColumn.classList.contains("fullscreen")
         ? "Exit Full Screen"
         : "Full Screen";
-    setTimeout(() => editor.layout(), 100);
+    setTimeout(() => {
+        if (window.editor) window.editor.layout();
+    }, 100);
 };
 
 document.addEventListener("keydown", e => {
@@ -525,162 +541,459 @@ document.addEventListener("keydown", e => {
     }
 });
 
-// Terminal state
-let terminalState = {
-    waitingForInput: false,
-    inputBuffer: '',
-    resolveInput: null,
-    programOutput: '',
-    currentInputLine: null
-};
+// Runtime/input state
+let inputResolver = null;
+let inputBuffer = "";
+let awaitingInput = false;
+let inputMode = "single";
+let runInProgress = false;
+let activeRunId = 0;
+let currentFetchController = null;
+let cSessionId = null;
+let cCursor = 0;
+let cPollTimer = null;
+let cPollInFlight = false;
+let cPollGeneration = 0;
+let cLocalInputChars = 0;
+let cRunResolve = null;
+let cRunReject = null;
+let cInputChain = Promise.resolve();
+const RUN_RESTARTED = "__RUN_RESTARTED__";
 
-// Function to append to terminal
-function appendToTerminal(text, className = '') {
-    const output = document.getElementById('output');
-    const span = document.createElement('span');
-    span.textContent = text;
-    if (className) span.className = className;
-    output.appendChild(span);
-    output.appendChild(document.createElement('br'));
-    output.scrollTop = output.scrollHeight;
+const outputEl = document.getElementById("output");
+const runStatus = document.getElementById("runStatus");
+outputEl.tabIndex = 0;
+outputEl.setAttribute("role", "textbox");
+outputEl.setAttribute("aria-label", "Terminal output and input");
+
+function setRunStatus(text) {
+    runStatus.textContent = text;
 }
 
-// Function to create input line
-function createInputLine(promptText = 'Enter input: ') {
-    const output = document.getElementById('output');
-    
-    // Create container for input line
-    const inputLine = document.createElement('div');
-    inputLine.className = 'input-line';
-    
-    // Create prompt
-    const prompt = document.createElement('span');
-    prompt.className = 'prompt';
-    prompt.textContent = promptText;
-    
-    // Create input field
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'input-field';
-    input.placeholder = 'Type here and press Enter...';
-    input.autofocus = true;
-    
-    inputLine.appendChild(prompt);
-    inputLine.appendChild(input);
-    output.appendChild(inputLine);
-    output.scrollTop = output.scrollHeight;
-    
-    return { inputLine, input };
+function pushOutput(text = "") {
+    outputEl.textContent += text;
+    outputEl.scrollTop = outputEl.scrollHeight;
+}
+
+function setInputMode(enabled) {
+    awaitingInput = enabled;
+    outputEl.classList.toggle("awaiting-input", enabled);
+    if (enabled) {
+        setRunStatus("Running (waiting for input...)");
+    } else if (runInProgress) {
+        setRunStatus("Running...");
+    }
+}
+
+function ensureRunActive(runId) {
+    if (runId !== activeRunId) {
+        throw new Error(RUN_RESTARTED);
+    }
+}
+
+function setTerminalCursor(enabled) {
+    outputEl.classList.toggle("awaiting-input", enabled);
+}
+
+function hasCSession() {
+    return Boolean(cSessionId);
+}
+
+function settleCRun(error = null) {
+    if (error) {
+        if (cRunReject) cRunReject(error);
+    } else {
+        if (cRunResolve) cRunResolve();
+    }
+    cRunResolve = null;
+    cRunReject = null;
+}
+
+function stopCPolling() {
+    cPollGeneration += 1;
+    cPollInFlight = false;
+    if (cPollTimer) {
+        clearTimeout(cPollTimer);
+        cPollTimer = null;
+    }
+    cSessionId = null;
+    cCursor = 0;
+    cLocalInputChars = 0;
+    cInputChain = Promise.resolve();
+    setTerminalCursor(false);
+}
+
+function stopCSessionOnServer(sessionIdToStop) {
+    if (!sessionIdToStop) return;
+    fetch("/run/c/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionIdToStop })
+    }).catch(() => {});
+}
+
+function cancelCurrentRun() {
+    const runningCSessionId = cSessionId;
+    activeRunId += 1;
+    runInProgress = false;
+    setInputMode(false);
+    setTerminalCursor(false);
+    inputBuffer = "";
+
+    if (currentFetchController) {
+        currentFetchController.abort();
+        currentFetchController = null;
+    }
+
+    if (inputResolver) {
+        const resolve = inputResolver;
+        inputResolver = null;
+        resolve("");
+    }
+
+    stopCSessionOnServer(runningCSessionId);
+    stopCPolling();
+    settleCRun(new Error(RUN_RESTARTED));
+}
+
+function startInput(promptText, runId, mode = "single") {
+    ensureRunActive(runId);
+    if (promptText) pushOutput(promptText);
+    outputEl.focus();
+    inputMode = mode;
+    setInputMode(true);
+    inputBuffer = "";
+
+    return new Promise((resolve) => {
+        inputResolver = resolve;
+    });
+}
+
+function finishInput() {
+    pushOutput("\n");
+    setInputMode(false);
+    inputMode = "single";
+    if (inputResolver) {
+        const resolve = inputResolver;
+        inputResolver = null;
+        resolve(inputBuffer);
+    }
+    inputBuffer = "";
+}
+
+function backspaceInput() {
+    if (!inputBuffer.length) return;
+    inputBuffer = inputBuffer.slice(0, -1);
+    outputEl.textContent = outputEl.textContent.slice(0, -1);
+}
+
+function appendInputChar(char) {
+    inputBuffer += char;
+    pushOutput(char);
+}
+
+function echoCInput(text) {
+    if (!text) return;
+    pushOutput(text);
+    cLocalInputChars += text.length;
+}
+
+function eraseCLocalChar() {
+    if (cLocalInputChars <= 0) return;
+    outputEl.textContent = outputEl.textContent.slice(0, -1);
+    cLocalInputChars -= 1;
+}
+
+async function sendCInput(data) {
+    if (!cSessionId) return;
+
+    const response = await fetch("/run/c/input", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: cSessionId, data })
+    });
+
+    if (!response.ok) {
+        throw new Error("Failed to send input");
+    }
+}
+
+function queueCInput(data) {
+    cInputChain = cInputChain.then(() => sendCInput(data)).catch(() => {});
+    return cInputChain;
+}
+
+async function pollCOutput(runId) {
+    if (!cSessionId || cPollInFlight) return;
+    cPollInFlight = true;
+    const currentGeneration = cPollGeneration;
+
+    try {
+        const response = await fetch(`/run/c/output?session_id=${encodeURIComponent(cSessionId)}&cursor=${cCursor}`);
+        if (!response.ok) {
+            throw new Error("Session closed");
+        }
+
+        const data = await response.json();
+        ensureRunActive(runId);
+        if (currentGeneration !== cPollGeneration) return;
+
+        pushOutput(data.output || "");
+        cCursor = data.cursor ?? cCursor;
+        cLocalInputChars = 0;
+
+        if (data.done) {
+            stopCPolling();
+            if (data.exit_code === 0) {
+                setRunStatus("Done");
+            } else {
+                setRunStatus(`Exited with code ${data.exit_code}`);
+            }
+            settleCRun();
+            return;
+        }
+    } catch (error) {
+        if (error?.name === "AbortError" || error?.message === RUN_RESTARTED) {
+            return;
+        }
+        stopCPolling();
+        settleCRun(error);
+        return;
+    } finally {
+        cPollInFlight = false;
+        if (cSessionId && currentGeneration === cPollGeneration) {
+            cPollTimer = setTimeout(() => pollCOutput(runId), 90);
+        }
+    }
+}
+
+function builtinRead(x) {
+    if (!Sk.builtinFiles || !Sk.builtinFiles.files[x]) {
+        throw new Error(`File not found: '${x}'`);
+    }
+    return Sk.builtinFiles.files[x];
+}
+
+outputEl.addEventListener("keydown", (event) => {
+    if (hasCSession()) {
+        if (event.ctrlKey && event.key.toLowerCase() === "c") {
+            event.preventDefault();
+            queueCInput("\u0003");
+            return;
+        }
+
+        if (event.key === "Enter") {
+            event.preventDefault();
+            echoCInput("\n");
+            queueCInput("\n");
+            cLocalInputChars = 0;
+            return;
+        }
+
+        if (event.key === "Backspace") {
+            event.preventDefault();
+            eraseCLocalChar();
+            queueCInput("\x7f");
+            return;
+        }
+
+        if (event.key === "Tab") {
+            event.preventDefault();
+            queueCInput("\t");
+            return;
+        }
+
+        if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+            event.preventDefault();
+            echoCInput(event.key);
+            queueCInput(event.key);
+            return;
+        }
+
+        event.preventDefault();
+        return;
+    }
+
+    if (!awaitingInput) {
+        event.preventDefault();
+        return;
+    }
+
+    if (inputMode === "multi" && event.key === "Enter" && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        appendInputChar("\n");
+        return;
+    }
+
+    if (inputMode === "multi" && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        finishInput();
+        return;
+    }
+
+    if (event.key === "Enter") {
+        event.preventDefault();
+        finishInput();
+        return;
+    }
+
+    if (event.key === "Backspace") {
+        event.preventDefault();
+        backspaceInput();
+        return;
+    }
+
+    if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault();
+        appendInputChar(event.key);
+        return;
+    }
+
+    event.preventDefault();
+});
+
+outputEl.addEventListener("paste", (event) => {
+    if (hasCSession()) {
+        event.preventDefault();
+        const pasted = event.clipboardData?.getData("text") || "";
+        if (pasted) {
+            echoCInput(pasted);
+            queueCInput(pasted);
+        }
+        return;
+    }
+
+    if (!awaitingInput) {
+        event.preventDefault();
+        return;
+    }
+
+    event.preventDefault();
+    const pasted = event.clipboardData?.getData("text") || "";
+    if (inputMode === "multi") {
+        for (const ch of pasted.replace(/\r/g, "")) {
+            appendInputChar(ch);
+        }
+        return;
+    }
+
+    for (const ch of pasted.replace(/\r/g, "")) {
+        if (ch === "\n") {
+            finishInput();
+            break;
+        }
+        appendInputChar(ch);
+    }
+});
+
+async function runPythonInBrowser(code, runId) {
+    Sk.configure({
+        output: (text) => {
+            ensureRunActive(runId);
+            pushOutput(text);
+        },
+        read: builtinRead,
+        inputfun: (promptText) => startInput(promptText, runId),
+        inputfunTakesPrompt: true,
+        __future__: Sk.python3,
+    });
+
+    await Sk.misceval.asyncToPromise(() =>
+        Sk.importMainWithBody("<stdin>", false, code, true),
+    );
+}
+
+async function runCompiledLanguage(code, language, runId) {
+    if (language !== "c") {
+        throw new Error(`Unsupported language: ${language}`);
+    }
+
+    const controller = new AbortController();
+    currentFetchController = controller;
+
+    const response = await fetch("/run/c/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+        signal: controller.signal
+    });
+
+    ensureRunActive(runId);
+    const result = await response.json();
+    ensureRunActive(runId);
+    currentFetchController = null;
+
+    if (result.error) {
+        throw new Error(result.error);
+    }
+
+    pushOutput(result.output || "");
+
+    if (!result.session_id) {
+        setRunStatus(result.status || "Done");
+        return;
+    }
+
+    cSessionId = result.session_id;
+    cCursor = 0;
+    cLocalInputChars = 0;
+    outputEl.focus();
+    setRunStatus("Running (waiting for input...)");
+    setTerminalCursor(true);
+    cPollGeneration += 1;
+    pollCOutput(runId);
+
+    await new Promise((resolve, reject) => {
+        cRunResolve = resolve;
+        cRunReject = reject;
+    });
 }
 
 // Handle input submission
 // Run code
 async function runCode() {
-    const out = document.getElementById("output");
-    const status = document.getElementById("runStatus");
-    
-    const code = editor.getValue();
-    
+    if (!window.editor) return;
+    const code = window.editor.getValue();
+
     if (!code.trim()) {
-        out.innerHTML = '';
-        status.textContent = "";
+        outputEl.textContent = '';
+        setRunStatus("");
         return;
     }
-    
-    // Clear terminal
-    out.innerHTML = '';
-    
+
+    if (runInProgress || awaitingInput || currentFetchController) {
+        cancelCurrentRun();
+    }
+
+    const runId = ++activeRunId;
+    runInProgress = true;
+    outputEl.textContent = '';
+    setRunStatus("Running...");
+
     try {
-        let inputData = '';
-        let programFinished = false;
-        let output = '';
-        let error = null;
-        
-        while (!programFinished) {
-            const data = new FormData();
-            data.append("question_id", "{{ question_id }}");
-            data.append("code", code);
-            data.append("language", languageSelect.value);
-            data.append("input", inputData);
-            
-            const response = await fetch("/run", { 
-                method: "POST", 
-                body: data 
-            });
-            const result = await response.json();
-            
-            if (result.needs_input) {
-                // Program is waiting for input - show prompt and get input
-                const userInput = await handleInput(result.prompt || '');
-                inputData += userInput + '\n';
-            } else {
-                // Program finished
-                programFinished = true;
-                output = result.output;
-                error = result.error;
-            }
-        }
-        
-        // Display ONLY the program output
-        if (error) {
-            out.textContent = error;
-            status.textContent = "Error";
+        if (languageSelect.value === "python") {
+            await runPythonInBrowser(code, runId);
+            if (runId !== activeRunId) return;
+            setRunStatus("Done");
         } else {
-            out.textContent = output;
-            status.textContent = "Done";
+            await runCompiledLanguage(code, languageSelect.value, runId);
+            if (runId !== activeRunId) return;
         }
-        
-    } catch (err) {
-        out.textContent = err;
-        status.textContent = "Error";
+    } catch (error) {
+        if (error?.name === "AbortError" || error?.message === RUN_RESTARTED) return;
+        if (runId !== activeRunId) return;
+        pushOutput(`\nTraceback/Error:\n${error.toString()}\n`);
+        setRunStatus("Error");
+    } finally {
+        if (runId !== activeRunId) return;
+        runInProgress = false;
+        setInputMode(false);
+        inputResolver = null;
+        inputBuffer = "";
+        currentFetchController = null;
     }
 }
 
-// Handle input submission
-function handleInput(promptText) {
-    return new Promise((resolve) => {
-        const output = document.getElementById('output');
-        
-        // Create input line
-        const inputLine = document.createElement('div');
-        inputLine.style.display = 'flex';
-        inputLine.style.alignItems = 'center';
-        
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.style.background = 'transparent';
-        input.style.border = 'none';
-        input.style.color = '#e5e7eb';
-        input.style.fontFamily = "'Courier New', monospace";
-        input.style.fontSize = '13px';
-        input.style.flex = '1';
-        input.style.outline = 'none';
-        input.style.padding = '2px 0';
-        input.autofocus = true;
-        
-        // Add to output
-        output.appendChild(inputLine);
-        inputLine.appendChild(input);
-        output.scrollTop = output.scrollHeight;
-        
-        // Handle enter key
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                const value = input.value;
-                
-                // Show what was typed
-                const textNode = document.createTextNode(value + '\n');
-                output.insertBefore(textNode, inputLine);
-                inputLine.remove();
-                
-                resolve(value);
-            }
-        });
-        
-        input.focus();
-    });
-}
 // Splitter for resizing panels
 const splitter = document.getElementById("splitter");
 const editorPanel = document.getElementById("editorPanel");
@@ -714,7 +1027,7 @@ document.addEventListener("mousemove", e => {
     editorPanel.style.height = y + "px";
     outputPanel.style.height = rect.height - y - splitter.offsetHeight + "px";
 
-    editor.layout();
+    if (window.editor) window.editor.layout();
 });
 
 // Timer functionality
@@ -763,7 +1076,7 @@ timerInterval = setInterval(updateTimer, 1000);
 
 // Form submission
 document.getElementById("codeForm").addEventListener("submit", function() {
-    document.getElementById("codeInput").value = editor.getValue();
+    document.getElementById("codeInput").value = window.editor ? window.editor.getValue() : "";
     document.getElementById("languageInput").value = languageSelect.value;
 });
 
@@ -782,7 +1095,9 @@ document.addEventListener('keydown', function(e) {
     // Ctrl+Shift+Space to format code
     else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === ' ') {
         e.preventDefault();
-        editor.getAction('editor.action.formatDocument').run();
+        if (window.editor) {
+            window.editor.getAction('editor.action.formatDocument').run();
+        }
     }
 });
 
@@ -790,7 +1105,7 @@ document.addEventListener('keydown', function(e) {
 document.addEventListener('DOMContentLoaded', function() {
     languageInput.value = 'python';
     currentLang.textContent = 'Python';
-    editor.setValue('');
+    if (window.editor) window.editor.setValue('');
 });
 </script>
 

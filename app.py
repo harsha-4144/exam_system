@@ -5,6 +5,9 @@ from psycopg2.extras import RealDictCursor
 import subprocess
 import resource
 import tempfile
+import threading
+import time
+import uuid
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
@@ -58,6 +61,176 @@ def limit_resources():
     """Set resource limits for code execution"""
     resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
     resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+
+
+# ---------- INTERACTIVE C SESSIONS ----------
+C_SESSION_TTL_SECONDS = 120
+c_sessions = {}
+c_sessions_lock = threading.Lock()
+
+
+def append_c_output(c_session, text):
+    with c_session["lock"]:
+        c_session["output"] += text
+        c_session["updated_at"] = time.time()
+
+
+def c_session_reader(c_session):
+    while True:
+        try:
+            data = c_session["stdout_pipe"].read(4096)
+            if not data:
+                break
+            append_c_output(c_session, data.decode("utf-8", errors="replace"))
+        except Exception:
+            break
+
+    exit_code = c_session["proc"].wait()
+    with c_session["lock"]:
+        c_session["done"] = True
+        c_session["exit_code"] = exit_code
+        c_session["updated_at"] = time.time()
+
+
+def prune_c_sessions():
+    now = time.time()
+    to_delete = []
+
+    with c_sessions_lock:
+        for sid, c_session in c_sessions.items():
+            with c_session["lock"]:
+                expired = c_session["done"] and (now - c_session["updated_at"]) > C_SESSION_TTL_SECONDS
+            if expired:
+                to_delete.append(sid)
+
+        for sid in to_delete:
+            c_session = c_sessions.pop(sid, None)
+            if c_session is None:
+                continue
+            try:
+                if c_session["stdin_pipe"]:
+                    c_session["stdin_pipe"].close()
+            except Exception:
+                pass
+            try:
+                if c_session["stdout_pipe"]:
+                    c_session["stdout_pipe"].close()
+            except Exception:
+                pass
+            try:
+                c_session["temp_dir"].cleanup()
+            except Exception:
+                pass
+
+
+def stop_c_session(session_id):
+    with c_sessions_lock:
+        c_session = c_sessions.pop(session_id, None)
+
+    if c_session is None:
+        return False
+
+    try:
+        c_session["proc"].terminate()
+    except Exception:
+        pass
+
+    try:
+        if c_session["stdin_pipe"]:
+            c_session["stdin_pipe"].close()
+    except Exception:
+        pass
+    try:
+        if c_session["stdout_pipe"]:
+            c_session["stdout_pipe"].close()
+    except Exception:
+        pass
+    try:
+        c_session["temp_dir"].cleanup()
+    except Exception:
+        pass
+
+    return True
+
+
+def compile_c_code(temp_dir, code):
+    source_file = os.path.join(temp_dir, "main.c")
+    executable = os.path.join(temp_dir, "main")
+
+    with open(source_file, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    compile_result = subprocess.run(
+        ["gcc", source_file, "-O2", "-std=c11", "-Wall", "-Wextra", "-o", executable],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    if compile_result.returncode != 0:
+        compile_output = (compile_result.stdout or "") + (compile_result.stderr or "")
+        return False, compile_output if compile_output else "Compilation failed", ""
+
+    return True, "", executable
+
+
+def start_c_session(code):
+    temp_dir = tempfile.TemporaryDirectory(prefix="exam_c_")
+    try:
+        ok, compile_output, executable = compile_c_code(temp_dir.name, code)
+        if not ok:
+            temp_dir.cleanup()
+            return {
+                "status": "Compilation failed",
+                "session_id": None,
+                "output": compile_output,
+                "done": True,
+                "exit_code": None,
+            }
+
+        runner = ["stdbuf", "-o0", "-e0", executable] if os.path.exists("/usr/bin/stdbuf") else [executable]
+        proc = subprocess.Popen(
+            runner,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=temp_dir.name,
+            close_fds=True,
+            bufsize=0,
+            preexec_fn=limit_resources,
+        )
+
+        session_id = uuid.uuid4().hex
+        c_session = {
+            "session_id": session_id,
+            "proc": proc,
+            "stdin_pipe": proc.stdin,
+            "stdout_pipe": proc.stdout,
+            "temp_dir": temp_dir,
+            "output": "",
+            "done": False,
+            "exit_code": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "lock": threading.Lock(),
+        }
+
+        with c_sessions_lock:
+            c_sessions[session_id] = c_session
+
+        reader = threading.Thread(target=c_session_reader, args=(c_session,), daemon=True)
+        reader.start()
+
+        return {
+            "status": "Running",
+            "session_id": session_id,
+            "output": "",
+            "done": False,
+            "exit_code": None,
+        }
+    except Exception:
+        temp_dir.cleanup()
+        raise
 
 # ---------- CODE EXECUTION ----------
 def execute_code(code, language, input_data):
@@ -127,22 +300,25 @@ def execute_c(code, input_data, tmpdir):
     # Compile
     try:
         compile_result = subprocess.run(
-            ['gcc', source_file, '-o', executable, '-std=c11'],
+            ['gcc', source_file, '-O2', '-std=c11', '-Wall', '-Wextra', '-o', executable],
             capture_output=True,
             text=True,
             timeout=10
         )
         
         if compile_result.returncode != 0:
+            compile_output = (compile_result.stdout or '') + (compile_result.stderr or '')
             return {
                 'success': False,
-                'output': 'Compilation Error',
-                'error': compile_result.stderr
+                'output': compile_output if compile_output else 'Compilation failed',
+                'error': None
             }
         
+        runner = ['stdbuf', '-o0', '-e0', executable] if os.path.exists('/usr/bin/stdbuf') else [executable]
+
         # Run
         run_result = subprocess.run(
-            [executable],
+            runner,
             input=input_data,
             capture_output=True,
             text=True,
@@ -150,10 +326,16 @@ def execute_c(code, input_data, tmpdir):
             preexec_fn=limit_resources
         )
         
+        combined_output = (run_result.stdout or '')
+        if run_result.stderr:
+            combined_output += run_result.stderr
+        if run_result.returncode != 0 and not run_result.stderr:
+            combined_output += f'Program exited with code {run_result.returncode}\n'
+
         return {
             'success': run_result.returncode == 0,
-            'output': run_result.stdout,
-            'error': run_result.stderr if run_result.stderr else None
+            'output': combined_output,
+            'error': None
         }
     except subprocess.TimeoutExpired:
         return {
@@ -294,7 +476,19 @@ def exam_page(qid):
     
     conn.close()
     
-    time_limit_minutes = q[2] // 60 if q[2] else 30
+    # Persist per-question timer deadline in session so refresh does not reset it.
+    configured_time_limit = int(q[2]) if q and q[2] else 30 * 60
+    now_ts = int(time.time())
+    exam_deadlines = session.get("exam_deadlines", {})
+    deadline_key = str(qid)
+
+    if deadline_key not in exam_deadlines:
+        exam_deadlines[deadline_key] = now_ts + configured_time_limit
+        session["exam_deadlines"] = exam_deadlines
+        session.modified = True
+
+    remaining_seconds = max(0, int(exam_deadlines[deadline_key]) - now_ts)
+    time_limit_minutes = max(1, configured_time_limit // 60)
     
     return render_template(
         "exam.html",
@@ -302,7 +496,7 @@ def exam_page(qid):
         title=q[0],
         description=q[1],
         examples=examples,
-        time_limit=q[2],
+        time_limit=remaining_seconds,
         time_limit_minutes=time_limit_minutes
     )
 
@@ -334,6 +528,117 @@ def run_code():
         "error": result.get('error'),
         "success": result.get('success', False)
     })
+
+
+@app.route("/run/c/start", methods=["POST"])
+def run_c_start():
+    if not is_logged_in():
+        return jsonify({"error": "Not logged in"}), 401
+
+    prune_c_sessions()
+    payload = request.get_json(silent=True) or {}
+    code = payload.get("code", "")
+
+    if not isinstance(code, str) or len(code) > 200000:
+        return jsonify({"error": "Invalid code payload"}), 400
+
+    try:
+        result = start_c_session(code)
+        return jsonify(result)
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "status": "Timed out",
+            "session_id": None,
+            "output": "Compilation exceeded timeout limits.\n",
+            "done": True,
+            "exit_code": None,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/run/c/input", methods=["POST"])
+def run_c_input():
+    if not is_logged_in():
+        return jsonify({"error": "Not logged in"}), 401
+
+    prune_c_sessions()
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id", "")
+    data = payload.get("data", "")
+
+    if not isinstance(session_id, str) or not isinstance(data, str) or len(data) > 4000:
+        return jsonify({"error": "Invalid input payload"}), 400
+
+    with c_sessions_lock:
+        c_session = c_sessions.get(session_id)
+
+    if c_session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    with c_session["lock"]:
+        if c_session["done"]:
+            return jsonify({"error": "Session already finished"}), 409
+
+    try:
+        c_session["stdin_pipe"].write(data.encode("utf-8", errors="ignore"))
+        c_session["stdin_pipe"].flush()
+    except Exception:
+        return jsonify({"error": "Failed to write input"}), 500
+
+    return jsonify({"ok": True})
+
+
+@app.route("/run/c/output", methods=["GET"])
+def run_c_output():
+    if not is_logged_in():
+        return jsonify({"error": "Not logged in"}), 401
+
+    prune_c_sessions()
+    session_id = request.args.get("session_id", "")
+    cursor_raw = request.args.get("cursor", "0")
+
+    try:
+        cursor = max(0, int(cursor_raw))
+    except ValueError:
+        return jsonify({"error": "Invalid cursor"}), 400
+
+    with c_sessions_lock:
+        c_session = c_sessions.get(session_id)
+
+    if c_session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    with c_session["lock"]:
+        output = c_session["output"][cursor:]
+        new_cursor = len(c_session["output"])
+        done = c_session["done"]
+        exit_code = c_session["exit_code"]
+        c_session["updated_at"] = time.time()
+
+    return jsonify({
+        "output": output,
+        "cursor": new_cursor,
+        "done": done,
+        "exit_code": exit_code,
+    })
+
+
+@app.route("/run/c/stop", methods=["POST"])
+def run_c_stop():
+    if not is_logged_in():
+        return jsonify({"error": "Not logged in"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id", "")
+    if not isinstance(session_id, str) or not session_id:
+        return jsonify({"error": "Invalid session id"}), 400
+
+    stopped = stop_c_session(session_id)
+    if not stopped:
+        return jsonify({"error": "Session not found"}), 404
+
+    return jsonify({"ok": True})
 
 @app.route("/submit", methods=["POST"])
 def submit():
