@@ -11,14 +11,6 @@
             --button-text: #000000;
         }
 
-        body.light {
-            --bg-overlay: rgba(255,255,255,0.65);
-            --card-bg: rgba(255,255,255,0.7);
-            --text: #111827;
-            --button-bg: #111827;
-            --button-text: #ffffff;
-        }
-
         * { box-sizing: border-box; }
 
         html, body {
@@ -46,15 +38,6 @@
             left: 40px;
             font-size: 22px;
             font-weight: 700;
-        }
-
-        .toggle {
-            position: absolute;
-            top: 32px;
-            right: 40px;
-            cursor: pointer;
-            font-size: 14px;
-            opacity: 0.85;
         }
 
         .card {
@@ -112,7 +95,6 @@
 <body>
 
 <div class="brand">CodeArenaX</div>
-<div class="toggle" onclick="toggleTheme()">Toggle Theme</div>
 
 <div class="card">
     <h2>Login</h2>
@@ -144,19 +126,6 @@
         Don't have an account? <a href="/register">Register</a>
     </div>
 </div>
-
-<script>
-    function toggleTheme() {
-        document.body.classList.toggle("light");
-        localStorage.setItem("theme",
-            document.body.classList.contains("light") ? "light" : "dark"
-        );
-    }
-
-    if (localStorage.getItem("theme") === "light") {
-        document.body.classList.add("light");
-    }
-</script>
 
 </body>
 </html>
